@@ -7,4 +7,4 @@
 void wifi_initialise(void);
 void wifi_wait_connected();
 
-#endif
+#endif /* _WIFI_UTILS_H_ */
