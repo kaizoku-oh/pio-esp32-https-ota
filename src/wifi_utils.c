@@ -7,13 +7,11 @@
 
 #include "wifi_utils.h"
 
-
-/* event group for wifi connection */
+/* Event group for wifi connection */
 static EventGroupHandle_t wifi_event_group;
 const int CONNECTED_BIT = BIT0;
 
-/* wifi event handler */
-static esp_err_t event_handler(void *ctx, system_event_t *event)
+static esp_err_t _wifi_event_handler(void *ctx, system_event_t *event)
 {
   switch(event->event_id)
   {
@@ -34,12 +32,12 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
 
 void wifi_initialise(void)
 {
-  /* initialize NVS, required for wifi */
+  /* Initialize NVS, required for wifi */
   ESP_ERROR_CHECK(nvs_flash_init());
-  /* connect to the wifi network */
+  /* Connect to the wifi network */
   wifi_event_group = xEventGroupCreate();
   tcpip_adapter_init();
-  ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
+  ESP_ERROR_CHECK(esp_event_loop_init(_wifi_event_handler, NULL));
   wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -56,7 +54,7 @@ void wifi_initialise(void)
   ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-void wifi_wait_connected()
+void wifi_wait_connected(void)
 {
   xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
 }
