@@ -21,11 +21,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install platformio
 
-    - name: Code static analysis
-      run: platformio check
-
     - name: Run PlatformIO build on selected platforms
       run: platformio run -e esp32dev
+
+    - name: Code static analysis
+      run: platformio check
 
     - name: Upload binaries to release
       uses: svenstaro/upload-release-action@v1-release
