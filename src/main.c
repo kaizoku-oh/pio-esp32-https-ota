@@ -30,11 +30,11 @@ extern const char root_ca_cert_pem_start[] asm("_binary_root_ca_cert_pem_start")
 extern const char root_ca_cert_pem_end[] asm("_binary_root_ca_cert_pem_end");
 
 /* http receive buffer */
-char http_rcv_buffer[HTTP_APP_RX_BUFFER_SIZE];
+char tcHttpRcvBuffer[HTTP_APP_RX_BUFFER_SIZE];
 
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+esp_err_t _http_event_handler(esp_http_client_event_t *pstEvent)
 {
-  switch(evt->event_id)
+  switch(pstEvent->event_id)
   {
   case HTTP_EVENT_ERROR:
     ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
@@ -47,13 +47,13 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     break;
   case HTTP_EVENT_ON_HEADER:
     ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER");
-    printf("%.*s", evt->data_len, (char*)evt->data);
+    printf("%.*s", pstEvent->data_len, (char*)pstEvent->data);
     break;
   case HTTP_EVENT_ON_DATA:
-    ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-    if(!esp_http_client_is_chunked_response(evt->client))
+    ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", pstEvent->data_len);
+    if(!esp_http_client_is_chunked_response(pstEvent->client))
     {
-      strncpy(http_rcv_buffer, (char*)evt->data, evt->data_len);
+      strncpy(tcHttpRcvBuffer, (char*)pstEvent->data, pstEvent->data_len);
     }
     break;
   case HTTP_EVENT_ON_FINISH:
@@ -68,43 +68,48 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 
 char* get_download_url()
 {
-  char* ret;
+  int s32HttpCode;
+  esp_err_t s32RetVal;
+  char* pcDownloadUrl;
+  cJSON *pstJsonObject;
+  cJSON *pstJsonDownloadUrl;
+  esp_http_client_handle_t pstClient;
 
-  ret = NULL;
+  pcDownloadUrl = NULL;
   esp_http_client_config_t config =
   {
     .url = API_URL,
     .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
     .event_handler = _http_event_handler,
   };
-
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  esp_err_t err = esp_http_client_perform(client);
-  if(err == ESP_OK)
+  pstClient = esp_http_client_init(&config);
+  s32RetVal = esp_http_client_perform(pstClient);
+  if(ESP_OK == s32RetVal)
   {
     ESP_LOGI(TAG, "Status = %d, content_length = %d",
-             esp_http_client_get_status_code(client),
-             esp_http_client_get_content_length(client));
-    if(esp_http_client_get_status_code(client) == 204)
+             esp_http_client_get_status_code(pstClient),
+             esp_http_client_get_content_length(pstClient));
+    s32HttpCode = esp_http_client_get_status_code(pstClient);
+    if(204 == s32HttpCode)
     {
       ESP_LOGI(TAG, "Device is already running the latest firmware");
     }
-    else
+    else if(200 == s32HttpCode)
     {
-      ESP_LOGI(TAG, "http_rcv_buffer: %s\n", http_rcv_buffer);
+      ESP_LOGI(TAG, "tcHttpRcvBuffer: %s\n", tcHttpRcvBuffer);
       /* parse the http json respose */
-      cJSON *json = cJSON_Parse(http_rcv_buffer);
-      if(json == NULL)
+      pstJsonObject = cJSON_Parse(tcHttpRcvBuffer);
+      if(pstJsonObject == NULL)
       {
         ESP_LOGW(TAG, "Response does not contain valid json, aborting...");
       }
       else
       {
-        cJSON *download_url = cJSON_GetObjectItemCaseSensitive(json, "download_url");
-        if(cJSON_IsString(download_url) && (download_url->valuestring != NULL))
+        pstJsonDownloadUrl = cJSON_GetObjectItemCaseSensitive(pstJsonObject, "download_url");
+        if(cJSON_IsString(pstJsonDownloadUrl) && (pstJsonDownloadUrl->valuestring != NULL))
         {
-          ret = download_url->valuestring;
-          ESP_LOGI(TAG, "download_url length: %d", strlen(ret));
+          pcDownloadUrl = pstJsonDownloadUrl->valuestring;
+          ESP_LOGI(TAG, "download_url length: %d", strlen(pcDownloadUrl));
         }
         else
         {
@@ -112,9 +117,13 @@ char* get_download_url()
         }
       }
     }
+    else
+    {
+      ESP_LOGW(TAG, "Failed to get URL with HTTP code: %d", s32HttpCode);
+    }
   }
-  esp_http_client_cleanup(client);
-  return ret;
+  esp_http_client_cleanup(pstClient);
+  return pcDownloadUrl;
 }
 
 void app_task(void *pvParameter)
@@ -128,18 +137,18 @@ void app_task(void *pvParameter)
 
 void check_update_task(void *pvParameter)
 {
-  char* download_url;
+  char* pcDownloadUrl;
 
   while(1)
   {
-    download_url = get_download_url();
-    if(download_url != NULL)
+    pcDownloadUrl = get_download_url();
+    if(pcDownloadUrl != NULL)
     {
-      ESP_LOGI(TAG, "download_url: %s", download_url);
+      ESP_LOGI(TAG, "download_url: %s", pcDownloadUrl);
       ESP_LOGI(TAG, "Downloading and installing new firmware");
       esp_http_client_config_t ota_client_config =
       {
-        .url = download_url,
+        .url = pcDownloadUrl,
         .cert_pem = root_ca_cert_pem_start,
         .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
         .buffer_size_tx = HTTP_INTERNAL_TX_BUFFER_SIZE,
@@ -157,7 +166,7 @@ void check_update_task(void *pvParameter)
     }
     else
     {
-      ESP_LOGW(TAG, "Could not get download_url");
+      ESP_LOGW(TAG, "Could not get download url");
     }
     vTaskDelay(30000 / portTICK_PERIOD_MS);
   }
@@ -168,7 +177,6 @@ void app_main()
   /* Block until connected to wifi */
   wifi_initialise();
   wifi_wait_connected();
-  ESP_LOGI(TAG, "connected to wifi network");
 
   /* start the check update task */
   xTaskCreate(&check_update_task, "check_update_task", 8192, NULL, 5, NULL);
