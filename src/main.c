@@ -10,7 +10,7 @@
 #include "wifi_utils.h"
 
 #define TAG                          "APP"
-#define BASE_URL                     "http://github-ota-api.herokuapp.com"
+#define BASE_URL                     "https://github-ota-api.herokuapp.com"
 #define ENDPOINT                     "/firmware/latest"
 #define GITHUB_USERNAME              "kaizoku-oh"
 #define GITHUB_REPOSITORY            "pio-esp32-https-ota"
@@ -26,8 +26,11 @@ static const char* API_URL = BASE_URL ENDPOINT
 
 /* ca certificate */
 /* openssl s_client -showcerts -verify 5 -connect s3.amazonaws.com:443 < /dev/null */
-extern const char root_ca_cert_pem_start[] asm("_binary_root_ca_cert_pem_start");
-extern const char root_ca_cert_pem_end[] asm("_binary_root_ca_cert_pem_end");
+extern const char aws_s3_root_ca_cert_pem_start[] asm("_binary_aws_s3_root_ca_cert_pem_start");
+extern const char aws_s3_root_ca_cert_pem_end[] asm("_binary_aws_s3_root_ca_cert_pem_end");
+/* openssl s_client -showcerts -verify 5 -connect herokuapp.com:443 < /dev/null */
+extern const char heroku_root_ca_cert_pem_start[] asm("_binary_heroku_root_ca_cert_pem_start");
+extern const char heroku_root_ca_cert_pem_end[] asm("_binary_heroku_root_ca_cert_pem_end");
 
 /* http receive buffer */
 char tcHttpRcvBuffer[HTTP_APP_RX_BUFFER_SIZE];
@@ -37,30 +40,30 @@ esp_err_t _http_event_handler(esp_http_client_event_t *pstEvent)
   switch(pstEvent->event_id)
   {
   case HTTP_EVENT_ERROR:
-    ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
+    ESP_LOGI(TAG, "HTTP error");
     break;
   case HTTP_EVENT_ON_CONNECTED:
-    ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+    ESP_LOGI(TAG, "HTTP connected to server");
     break;
-  case HTTP_EVENT_HEADER_SENT:
-    ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
+  case HTTP_EVENT_HEADERS_SENT:
+    ESP_LOGI(TAG, "All HTTP headers are sent to server");
     break;
   case HTTP_EVENT_ON_HEADER:
-    ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER");
+    ESP_LOGI(TAG, "Received HTTP header from server");
     printf("%.*s", pstEvent->data_len, (char*)pstEvent->data);
     break;
   case HTTP_EVENT_ON_DATA:
-    ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", pstEvent->data_len);
+    ESP_LOGI(TAG, "Received data from server, len=%d", pstEvent->data_len);
     if(!esp_http_client_is_chunked_response(pstEvent->client))
     {
       strncpy(tcHttpRcvBuffer, (char*)pstEvent->data, pstEvent->data_len);
     }
     break;
   case HTTP_EVENT_ON_FINISH:
-    ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
+    ESP_LOGI(TAG, "HTTP session is finished");
     break;
   case HTTP_EVENT_DISCONNECTED:
-    ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+    ESP_LOGI(TAG, "HTTP connection is closed");
     break;
   }
   return ESP_OK;
@@ -81,6 +84,7 @@ char* get_download_url()
     .url = API_URL,
     .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
     .event_handler = _http_event_handler,
+    .cert_pem = heroku_root_ca_cert_pem_start,
   };
   pstClient = esp_http_client_init(&config);
   s32RetVal = esp_http_client_perform(pstClient);
@@ -149,7 +153,7 @@ void check_update_task(void *pvParameter)
       esp_http_client_config_t ota_client_config =
       {
         .url = pcDownloadUrl,
-        .cert_pem = root_ca_cert_pem_start,
+        .cert_pem = aws_s3_root_ca_cert_pem_start,
         .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
         .buffer_size_tx = HTTP_INTERNAL_TX_BUFFER_SIZE,
       };
