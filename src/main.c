@@ -1,39 +1,65 @@
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "cJSON.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "esp_http_client.h"
-#include "esp_https_ota.h"
+#include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <esp_http_client.h>
+#include <esp_https_ota.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/event_groups.h>
+#include <freertos/timers.h>
+#include <cJSON.h>
 
-#include "wifi_utils.h"
+#include "wifi_manager.h"
 
 #define TAG                          "APP"
+
+#define OTA_TASK_STACK_SIZE          8192
+#define OTA_TASK_PRIORITY            5
+#define OTA_QUEUE_ITEMS_COUNT        5
+#define OTA_TIMER_TYPE_PERIODIC      pdTRUE
+#define OTA_TIMER_PERIOD_MS          30000
+
+#define APP_TASK_STACK_SIZE          2048
+#define APP_TASK_PRIORITY            5
+
 #define BASE_URL                     "https://github-ota-api.herokuapp.com"
 #define ENDPOINT                     "/firmware/latest"
 #define GITHUB_USERNAME              "kaizoku-oh"
 #define GITHUB_REPOSITORY            "pio-esp32-https-ota"
 #define DEVICE_CURRENT_FW_VERSION    APP_VERSION
+
 #define HTTP_INTERNAL_TX_BUFFER_SIZE 1024
 #define HTTP_INTERNAL_RX_BUFFER_SIZE 1024
 #define HTTP_APP_RX_BUFFER_SIZE      1024
+
+typedef enum
+{
+  OTA_START = 0,
+}ota_event_t;
 
 static const char* API_URL = BASE_URL ENDPOINT
                              "?github_username="GITHUB_USERNAME
                              "&github_repository="GITHUB_REPOSITORY
                              "&device_current_fw_version="DEVICE_CURRENT_FW_VERSION;
 
-/* ca certificate */
-/* openssl s_client -showcerts -verify 5 -connect s3.amazonaws.com:443 < /dev/null */
-extern const char aws_s3_root_ca_cert_pem_start[] asm("_binary_aws_s3_root_ca_cert_pem_start");
-extern const char aws_s3_root_ca_cert_pem_end[] asm("_binary_aws_s3_root_ca_cert_pem_end");
-/* openssl s_client -showcerts -verify 5 -connect herokuapp.com:443 < /dev/null */
-extern const char heroku_root_ca_cert_pem_start[] asm("_binary_heroku_root_ca_cert_pem_start");
-extern const char heroku_root_ca_cert_pem_end[] asm("_binary_heroku_root_ca_cert_pem_end");
+/* $ openssl s_client -showcerts -verify 5 -connect s3.amazonaws.com:443 < /dev/null */
+extern const char tcAwsS3RootCaCertPemStart[] asm("_binary_aws_s3_root_ca_cert_pem_start");
+extern const char tcAwsS3RootCaCertPemEnd[] asm("_binary_aws_s3_root_ca_cert_pem_end");
+/* $ openssl s_client -showcerts -verify 5 -connect herokuapp.com:443 < /dev/null */
+extern const char tcHerokuRootCaCertPemStart[] asm("_binary_heroku_root_ca_cert_pem_start");
+extern const char tcHerokuRootCaCertPemEnd[] asm("_binary_heroku_root_ca_cert_pem_end");
 
-/* http receive buffer */
-char tcHttpRcvBuffer[HTTP_APP_RX_BUFFER_SIZE];
+typedef struct
+{
+  TimerHandle_t stOtaTimer;                      /**< Software timer to trigger update task */
+  QueueHandle_t stOtaQueue;                      /**< Queue handler to receive ota events   */
+  char tcHttpRcvBuffer[HTTP_APP_RX_BUFFER_SIZE]; /**< HTTP receive buffer                   */
+}app_main_t;
+
+static app_main_t APPi_stMain;
 
 esp_err_t _http_event_handler(esp_http_client_event_t *pstEvent)
 {
@@ -56,7 +82,7 @@ esp_err_t _http_event_handler(esp_http_client_event_t *pstEvent)
     ESP_LOGI(TAG, "Received data from server, len=%d", pstEvent->data_len);
     if(!esp_http_client_is_chunked_response(pstEvent->client))
     {
-      strncpy(tcHttpRcvBuffer, (char*)pstEvent->data, pstEvent->data_len);
+      strncpy(APPi_stMain.tcHttpRcvBuffer, (char*)pstEvent->data, pstEvent->data_len);
     }
     break;
   case HTTP_EVENT_ON_FINISH:
@@ -69,11 +95,10 @@ esp_err_t _http_event_handler(esp_http_client_event_t *pstEvent)
   return ESP_OK;
 }
 
-char* get_download_url()
+char* get_download_url(void)
 {
   int s32HttpCode;
-  esp_err_t s32RetVal;
-  char* pcDownloadUrl;
+  char *pcDownloadUrl;
   cJSON *pstJsonObject;
   cJSON *pstJsonDownloadUrl;
   esp_http_client_handle_t pstClient;
@@ -84,13 +109,13 @@ char* get_download_url()
     .url = API_URL,
     .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
     .event_handler = _http_event_handler,
-    .cert_pem = heroku_root_ca_cert_pem_start,
+    .cert_pem = tcHerokuRootCaCertPemStart,
   };
   pstClient = esp_http_client_init(&config);
-  s32RetVal = esp_http_client_perform(pstClient);
-  if(ESP_OK == s32RetVal)
+  if(ESP_OK == esp_http_client_perform(pstClient))
   {
-    ESP_LOGI(TAG, "Status = %d, content_length = %d",
+    ESP_LOGI(TAG,
+             "Status = %d, content_length = %d",
              esp_http_client_get_status_code(pstClient),
              esp_http_client_get_content_length(pstClient));
     s32HttpCode = esp_http_client_get_status_code(pstClient);
@@ -100,17 +125,17 @@ char* get_download_url()
     }
     else if(200 == s32HttpCode)
     {
-      ESP_LOGI(TAG, "tcHttpRcvBuffer: %s\n", tcHttpRcvBuffer);
+      ESP_LOGI(TAG, "tcHttpRcvBuffer: %s\n", APPi_stMain.tcHttpRcvBuffer);
       /* parse the http json respose */
-      pstJsonObject = cJSON_Parse(tcHttpRcvBuffer);
-      if(pstJsonObject == NULL)
+      pstJsonObject = cJSON_Parse(APPi_stMain.tcHttpRcvBuffer);
+      if(!pstJsonObject)
       {
         ESP_LOGW(TAG, "Response does not contain valid json, aborting...");
       }
       else
       {
         pstJsonDownloadUrl = cJSON_GetObjectItemCaseSensitive(pstJsonObject, "download_url");
-        if(cJSON_IsString(pstJsonDownloadUrl) && (pstJsonDownloadUrl->valuestring != NULL))
+        if(cJSON_IsString(pstJsonDownloadUrl) && (pstJsonDownloadUrl->valuestring))
         {
           pcDownloadUrl = pstJsonDownloadUrl->valuestring;
           ESP_LOGI(TAG, "download_url length: %d", strlen(pcDownloadUrl));
@@ -139,51 +164,104 @@ void app_task(void *pvParameter)
   }
 }
 
-void check_update_task(void *pvParameter)
+void ota_task(void *pvParameter)
 {
-  char* pcDownloadUrl;
+  char *pcDownloadUrl;
+  ota_event_t eOtaEvent;
 
   while(1)
   {
-    pcDownloadUrl = get_download_url();
-    if(pcDownloadUrl != NULL)
+    if(pdPASS == xQueueReceive(APPi_stMain.stOtaQueue, &eOtaEvent, portMAX_DELAY))
     {
-      ESP_LOGI(TAG, "download_url: %s", pcDownloadUrl);
-      ESP_LOGI(TAG, "Downloading and installing new firmware");
-      esp_http_client_config_t ota_client_config =
+      switch(eOtaEvent)
       {
-        .url = pcDownloadUrl,
-        .cert_pem = aws_s3_root_ca_cert_pem_start,
-        .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
-        .buffer_size_tx = HTTP_INTERNAL_TX_BUFFER_SIZE,
-      };
-      esp_err_t ret = esp_https_ota(&ota_client_config);
-      if (ret == ESP_OK)
-      {
-        ESP_LOGI(TAG, "OTA OK, restarting...");
-        esp_restart();
-      }
-      else
-      {
-        ESP_LOGE(TAG, "OTA failed...");
+      case OTA_START:
+        pcDownloadUrl = get_download_url();
+        if(pcDownloadUrl)
+        {
+          ESP_LOGI(TAG, "download_url: %s", pcDownloadUrl);
+          ESP_LOGI(TAG, "Downloading and installing new firmware");
+          esp_http_client_config_t ota_client_config =
+          {
+            .url = pcDownloadUrl,
+            .cert_pem = tcAwsS3RootCaCertPemStart,
+            .buffer_size = HTTP_INTERNAL_RX_BUFFER_SIZE,
+            .buffer_size_tx = HTTP_INTERNAL_TX_BUFFER_SIZE,
+          };
+          if(ESP_OK == esp_https_ota(&ota_client_config))
+          {
+            ESP_LOGI(TAG, "OTA OK, restarting...");
+            esp_restart();
+          }
+          else
+          {
+            ESP_LOGE(TAG, "OTA failed...");
+          }
+        }
+        else
+        {
+          ESP_LOGW(TAG, "Could not get download url");
+        }
+        break;
+      default:
+        ESP_LOGW(TAG, "Unknow OTA event");
+        break;
       }
     }
-    else
-    {
-      ESP_LOGW(TAG, "Could not get download url");
-    }
-    vTaskDelay(30000 / portTICK_PERIOD_MS);
   }
 }
 
-void app_main()
+void wifi_manager_sta_got_ip_cb(void *pvParameter)
 {
-  /* Block until connected to wifi */
-  wifi_initialise();
-  wifi_wait_connected();
+  ip_event_got_ip_t *pstIPAddr;
+  char tcIpString[sizeof("xxx.xxx.xxx.xxx")];
 
-  /* start the check update task */
-  xTaskCreate(&check_update_task, "check_update_task", 8192, NULL, 5, NULL);
+  pstIPAddr = (ip_event_got_ip_t*)pvParameter;
+  /* transform IP to human readable string */
+  esp_ip4addr_ntoa(&pstIPAddr->ip_info.ip, tcIpString, IP4ADDR_STRLEN_MAX);
+  ESP_LOGI(TAG, "I have a connection and my IP is %s!", tcIpString);
+  /* start the ota timer */
+  xTimerStart(APPi_stMain.stOtaTimer, (TickType_t)0);
+}
+
+void wifi_manager_sta_discon_cb(void *pvParameter)
+{
+  wifi_event_sta_disconnected_t *pstWifiDiscon;
+
+  pstWifiDiscon = (wifi_event_sta_disconnected_t*)pvParameter;
+  ESP_LOGW(TAG, "Station disconnected with reason code: %d", pstWifiDiscon->reason);
+  /* stop the ota timer */
+  xTimerStop(APPi_stMain.stOtaTimer, (TickType_t)0);
+}
+
+void timer_ota_cb(TimerHandle_t stTimerHandle)
+{
+  ota_event_t eOtaEvent;
+
+  ESP_LOGI(TAG, "It's time to check for an update");
+  eOtaEvent = OTA_START;
+  xQueueSend(APPi_stMain.stOtaQueue, &eOtaEvent, portMAX_DELAY);
+}
+
+void app_main(void)
+{
+  /* start the wifi manager */
+  wifi_manager_start();
+  /* register a callback to be called when station is connected to AP */
+  wifi_manager_set_callback(WM_EVENT_STA_GOT_IP, &wifi_manager_sta_got_ip_cb);
+  /* register a callback to be called when station is disconnected from AP */
+  wifi_manager_set_callback(WM_EVENT_STA_DISCONNECTED, &wifi_manager_sta_discon_cb);
+
   /* start the app task */
-  xTaskCreate(&app_task, "app_task", 2048, NULL, 5, NULL);
+  xTaskCreate(&app_task, "app", APP_TASK_STACK_SIZE, NULL, APP_TASK_PRIORITY, NULL);
+  /* create queue to receive ota events */
+  APPi_stMain.stOtaQueue = xQueueCreate(OTA_QUEUE_ITEMS_COUNT, sizeof(ota_event_t));
+  /* start the check update task */
+  xTaskCreate(&ota_task, "ota", OTA_TASK_STACK_SIZE, NULL, OTA_TASK_PRIORITY, NULL);
+  /* create a timer to trigger the update task peridically */
+  APPi_stMain.stOtaTimer = xTimerCreate("ota",
+                                        pdMS_TO_TICKS(OTA_TIMER_PERIOD_MS),
+                                        OTA_TIMER_TYPE_PERIODIC,
+                                        (void *)0,
+                                        timer_ota_cb);
 }
